@@ -2,65 +2,125 @@ package main
 
 import (
 	"crypto/tls"
-	"log/slog"
+	"fmt"
 	"net"
-	"strconv"
-	"strings"
 	"time"
 )
 
-func ScanTLS(host Host, out chan<- string, geo *Geo) {
-	if host.IP == nil {
-		ip, err := LookupIP(host.Origin)
-		if err != nil {
-			slog.Debug("Failed to get IP from the origin", "origin", host.Origin, "err", err)
-			return
-		}
-		host.IP = ip
+// ScanResult holds the result of a TLS scan for a single host.
+type ScanResult struct {
+	IP          string
+	Port        string
+	ServerName  string
+	Fingerprint string
+	HasReality  bool
+	Latency     time.Duration
+	Error       error
+}
+
+// Scanner performs TLS/Reality detection scans against targets.
+type Scanner struct {
+	Timeout    time.Duration
+	Concurrent int
+	Results    chan ScanResult
+}
+
+// NewScanner creates a Scanner with sensible defaults.
+func NewScanner(timeout time.Duration, concurrent int) *Scanner {
+	return &Scanner{
+		Timeout:    timeout,
+		Concurrent: concurrent,
+		Results:    make(chan ScanResult, concurrent*2),
 	}
-	hostPort := net.JoinHostPort(host.IP.String(), strconv.Itoa(port))
-	conn, err := net.DialTimeout("tcp", hostPort, time.Duration(timeout)*time.Second)
+}
+
+// Scan initiates scanning over a list of address strings ("ip:port").
+func (s *Scanner) Scan(targets []string) {
+	sem := make(chan struct{}, s.Concurrent)
+	for _, target := range targets {
+		sem <- struct{}{}
+		go func(addr string) {
+			defer func() { <-sem }()
+			s.Results <- s.scanOne(addr)
+		}(target)
+	}
+	// Drain semaphore to wait for all goroutines.
+	for i := 0; i < s.Concurrent; i++ {
+		sem <- struct{}{}
+	}
+	close(s.Results)
+}
+
+// scanOne performs a TLS handshake against addr and detects Reality markers.
+func (s *Scanner) scanOne(addr string) ScanResult {
+	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
-		slog.Debug("Cannot dial", "target", hostPort)
-		return
+		return ScanResult{IP: addr, Error: fmt.Errorf("invalid address: %w", err)}
 	}
-	defer conn.Close()
-	err = conn.SetDeadline(time.Now().Add(time.Duration(timeout) * time.Second))
+
+	start := time.Now()
+	dialer := &net.Dialer{Timeout: s.Timeout}
+	rawConn, err := dialer.Dial("tcp", addr)
 	if err != nil {
-		slog.Error("Error setting deadline", "err", err)
-		return
+		return ScanResult{IP: host, Port: port, Error: err}
 	}
+	defer rawConn.Close()
+
 	tlsCfg := &tls.Config{
-		InsecureSkipVerify: true,
-		NextProtos:         []string{"h2", "http/1.1"},
-		CurvePreferences:   []tls.CurveID{tls.X25519},
+		InsecureSkipVerify: true, // We are probing; cert validity is not the goal.
+		ServerName:         host,
 	}
-	if host.Type == HostTypeDomain {
-		tlsCfg.ServerName = host.Origin
+	tlsConn := tls.Client(rawConn, tlsCfg)
+	tlsConn.SetDeadline(time.Now().Add(s.Timeout))
+
+	if err := tlsConn.Handshake(); err != nil {
+		return ScanResult{IP: host, Port: port, Latency: time.Since(start), Error: err}
 	}
-	c := tls.Client(conn, tlsCfg)
-	err = c.Handshake()
-	if err != nil {
-		slog.Debug("TLS handshake failed", "target", hostPort)
-		return
+	latency := time.Since(start)
+
+	state := tlsConn.ConnectionState()
+	fingerprint := certFingerprint(state)
+	hasReality := detectReality(state)
+
+	serverName := state.ServerName
+	if serverName == "" {
+		serverName = host
 	}
-	state := c.ConnectionState()
-	alpn := state.NegotiatedProtocol
-	domain := state.PeerCertificates[0].Subject.CommonName
-	issuers := strings.Join(state.PeerCertificates[0].Issuer.Organization, " | ")
-	log := slog.Info
-	feasible := true
-	geoCode := geo.GetGeo(host.IP)
-	if state.Version != tls.VersionTLS13 || alpn != "h2" || len(domain) == 0 || len(issuers) == 0 {
-		// not feasible
-		log = slog.Debug
-		feasible = false
-	} else {
-		out <- strings.Join([]string{host.IP.String(), host.Origin, domain, "\"" + issuers + "\"", geoCode}, ",") +
-			"\n"
+
+	return ScanResult{
+		IP:          host,
+		Port:        port,
+		ServerName:  serverName,
+		Fingerprint: fingerprint,
+		HasReality:  hasReality,
+		Latency:     latency,
 	}
-	log("Connected to target", "feasible", feasible, "ip", host.IP.String(),
-		"origin", host.Origin,
-		"tls", tls.VersionName(state.Version), "alpn", alpn, "cert-domain", domain, "cert-issuer", issuers,
-		"geo", geoCode)
+}
+
+// certFingerprint returns a short identifier for the leaf certificate, if any.
+func certFingerprint(state tls.ConnectionState) string {
+	if len(state.PeerCertificates) == 0 {
+		return ""
+	}
+	cert := state.PeerCertificates[0]
+	// Use Subject + serial as a lightweight fingerprint.
+	return fmt.Sprintf("%s/%s", cert.Subject.CommonName, cert.SerialNumber.String())
+}
+
+// detectReality inspects the TLS state for known Reality/XTLS markers.
+// Reality presents a valid TLS certificate while the underlying protocol
+// differs; we use heuristics such as unusual ALPN or missing session tickets.
+func detectReality(state tls.ConnectionState) bool {
+	// Heuristic 1: No negotiated ALPN and no session ticket — common in Reality.
+	if state.NegotiatedProtocol == "" && !state.DidResume {
+		return true
+	}
+	// Heuristic 2: ALPN advertised as raw HTTP/1.1 without a matching cert SAN.
+	if state.NegotiatedProtocol == "http/1.1" && len(state.PeerCertificates) > 0 {
+		cert := state.PeerCertificates[0]
+		if len(cert.DNSNames) == 0 && len(cert.IPAddresses) == 0 {
+			return true
+		}
+	}
+	return false
 }
