@@ -75,6 +75,7 @@ func (ow *OutputWriter) Write(r ScanResult) error {
 	case "json":
 		ow.results = append(ow.results, r)
 	case "csv":
+		// Write all results to CSV, including non-Reality ones, for completeness
 		err := ow.csvW.Write([]string{
 			r.IP,
 			fmt.Sprintf("%d", r.Port),
@@ -125,9 +126,3 @@ func (ow *OutputWriter) Close() error {
 	} else if ow.format == "csv" {
 		ow.csvW.Flush()
 	}
-
-	if ow.file != os.Stdout {
-		return ow.file.Close()
-	}
-	return nil
-}
