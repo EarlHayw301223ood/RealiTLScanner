@@ -96,6 +96,10 @@ func (ow *OutputWriter) Write(r ScanResult) error {
 		if r.IsReality {
 			status = "YES"
 		}
+		// Only print results where Reality was detected, to reduce noise
+		if !r.IsReality {
+			return nil
+		}
 		line := fmt.Sprintf("%s:%d\treality=%s\tfp=%s\tsni=%s\tcountry=%s\tasn=%s\tlatency=%dms",
 			r.IP, r.Port, status, r.Fingerprint, r.ServerName, r.Country, r.ASN, r.Latency)
 		if r.Error != "" {
